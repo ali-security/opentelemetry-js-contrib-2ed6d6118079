@@ -1,18 +1,29 @@
 name: Test Packages
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Comma-separated nx project names to test (empty = all SEAL_PROJECTS)"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
+
+# Sealed build: `nx affected` resolves to nothing on the fork (no origin/main
+# delta), so every affected-based step is pinned to the target package plus the
+# packages touched by the CVE patch set.
+env:
+  SEAL_PROJECTS: "@opentelemetry/instrumentation-cassandra-driver,@opentelemetry/instrumentation-amqplib,@opentelemetry/instrumentation-aws-sdk,@opentelemetry/instrumentation-document-load,@opentelemetry/instrumentation-hapi,@opentelemetry/instrumentation-ioredis,@opentelemetry/instrumentation-knex,@opentelemetry/instrumentation-memcached,@opentelemetry/instrumentation-mongodb,@opentelemetry/instrumentation-mongoose,@opentelemetry/instrumentation-mysql,@opentelemetry/instrumentation-mysql2,@opentelemetry/instrumentation-nestjs-core,@opentelemetry/instrumentation-net,@opentelemetry/instrumentation-pg,@opentelemetry/instrumentation-redis,@opentelemetry/instrumentation-tedious,@opentelemetry/sampler-aws-xray"
+  SEAL_SERVICES: "cassandra memcached mongodb mssql mysql postgres rabbitmq redis"
 
 jobs:
   compile:
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     env:
       NPM_CONFIG_UNSAFE_PERM: true
       NODE_OPTIONS: --max-old-space-size=4096
@@ -29,34 +40,19 @@ jobs:
       - name: Install
         run: npm ci --ignore-scripts
         timeout-minutes: 10
-      # Note: when pushing to main we want to test only what changed in
-      # last commit. Otherwise we want to test all changes from origin/main.
-      # So we set the right values for base and head commits depending
-      # on the type of event (PR or push)
-      # ref: https://nx.dev/ci/features/affected#configure-affected-on-ci
-      - name: Set base and head commits
-        run: |
-          if [ "${{github.event_name}}" == "push" ]; then
-            echo "NX_BASE=origin/main~1" >> "$GITHUB_ENV"
-            echo "NX_HEAD=origin/main" >> "$GITHUB_ENV"
-          else
-            echo "NX_BASE=origin/main" >> "$GITHUB_ENV"
-            echo "NX_HEAD=HEAD" >> "$GITHUB_ENV"
-          fi
-      - name: Compile (Delta)
-        run: npm run compile:ci:affected
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: compile-cache-${{ github.run_number }}
-          path: .nx
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 7
+      - name: Compile
+        run: npx nx run-many -t compile -p "$SEAL_PROJECTS"
 
   unit-test:
     needs: compile
     runs-on: ubuntu-latest
+    timeout-minutes: 50
+    # redis.cluster.test.ts (a patched path) only runs against a live cluster;
+    # upstream has none in CI, so a single-node cluster is started below.
+    env:
+      RUN_REDIS_CLUSTER_TESTS: "1"
+      OPENTELEMETRY_REDIS_CLUSTER_HOST: "127.0.0.1"
+      OPENTELEMETRY_REDIS_CLUSTER_PORT: "7001"
     strategy:
       fail-fast: false
       matrix:
@@ -79,37 +75,66 @@ jobs:
       - name: Install
         run: npm ci
         timeout-minutes: 10
-      - name: Download Build Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: compile-cache-${{ github.run_number }}
-          path: .nx
-      # Note: see comment in the compile job
-      - name: Set base and head commits
+      - name: Compile
+        run: npx nx run-many -t compile -p "$SEAL_PROJECTS"
+      - name: Pack
+        if: ${{ matrix.node == '24' }}
         run: |
-          if [ "${{github.event_name}}" == "push" ]; then
-            echo "NX_BASE=origin/main~1" >> "$GITHUB_ENV"
-            echo "NX_HEAD=origin/main" >> "$GITHUB_ENV"
-          else
-            echo "NX_BASE=origin/main" >> "$GITHUB_ENV"
-            echo "NX_HEAD=HEAD" >> "$GITHUB_ENV"
-          fi
-      - name: Compile (Delta)
-        run: npm run compile:ci:affected
-      - name: Unit tests (Browser - Delta)
-        if: ${{ matrix.node == '22' }}
-        run: npm run test:browser:ci:affected
-      - name: Start Test Services (Delta)
-        run: npm run test-services:start:affected
-      - name: Unit tests (Nodejs - Delta)
-        run: npm run test:ci:affected
-      - name: Stop Test Services (Delta)
+          mkdir -p /tmp/pack
+          npm pack --workspace=packages/instrumentation-cassandra-driver --pack-destination=/tmp/pack
+          mv /tmp/pack/opentelemetry-instrumentation-cassandra-driver-0.64.0.tgz /tmp/pack/instrumentation-cassandra-driver-0.64.0.tgz
+      - name: Upload Package Artifact
+        if: ${{ matrix.node == '24' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-tarball
+          path: /tmp/pack/instrumentation-cassandra-driver-0.64.0.tgz
+          if-no-files-found: error
+      - name: Unit tests (Browser)
+        if: ${{ matrix.node == '22' && inputs.test-filter == '' }}
+        run: npx nx run-many -t test:browser -p "$SEAL_PROJECTS"
+      - name: Start Test Services
+        run: |
+          for i in 1 2 3; do
+            docker compose -f test/docker-compose.yaml up -d --wait $SEAL_SERVICES && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            docker compose -f test/docker-compose.yaml down
+            sleep 10
+          done
+      - name: Start Redis Cluster
+        run: |
+          docker run -d --name seal-redis-cluster --network host redis:7 redis-server --port 7001 --cluster-enabled yes --cluster-announce-ip 127.0.0.1 --save "" --appendonly no
+          for i in $(seq 1 30); do docker exec seal-redis-cluster redis-cli -p 7001 ping && break; sleep 1; done
+          docker exec seal-redis-cluster redis-cli -p 7001 cluster addslotsrange 0 16383
+          for i in $(seq 1 30); do docker exec seal-redis-cluster redis-cli -p 7001 cluster info | grep -q cluster_state:ok && break; sleep 1; done
+          docker exec seal-redis-cluster redis-cli -p 7001 cluster info | grep cluster_state:ok
+      - name: Unit tests (Nodejs)
+        run: |
+          PROJECTS="${{ inputs.test-filter }}"
+          if [ -z "$PROJECTS" ]; then PROJECTS="$SEAL_PROJECTS"; fi
+          npx cross-env NODE_OPTIONS='-r dotenv/config' DOTENV_CONFIG_PATH=./test/test-services.env nx run-many -t test -p "$PROJECTS"
+      - name: Stop Test Services
         if: always()
-        run: npm run test-services:stop
+        run: |
+          if docker inspect seal-redis-cluster >/dev/null 2>&1; then docker rm -f seal-redis-cluster; fi
+          npm run test-services:stop
+      - name: Report skipped tests
+        if: always()
+        run: |
+          cat <<'SKIPS'
+          Pending (skipped) tests in these suites and why:
+          - instrumentation-ioredis "should create a child span for pubsub": upstream marks it it.skip (test/ioredis.test.ts).
+          - instrumentation-ioredis "should instrument connect with requireParentSpan equal false": upstream marks it it.skip (test/ioredis.test.ts).
+          - instrumentation-ioredis "should redact ACL SETUSER arguments in db.statement": this.skip() when the installed ioredis client has no acl() method (older ioredis versions under test-all-versions).
+          - instrumentation-aws-sdk "sqs receive context": upstream it.skip; span-context propagation to the SQS ReceiveMessage handler is broken with @aws-sdk/client-sqs >= 3.316.0 (open-telemetry/opentelemetry-js-contrib#1477).
+          - instrumentation-redis "redis v4-v5 cluster" (4 tests): skipped unless RUN_REDIS_CLUSTER_TESTS is set; they run against a live single-node cluster in the unit-test job and are skipped in test-all-versions, where upstream never runs them.
+          - instrumentation-redis "redis v4-v5 cluster mock" suite: skipped when the installed redis version does not export RedisClusterMultiCommand.
+          SKIPS
 
   test-all-versions:
     needs: compile
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -118,6 +143,12 @@ jobs:
           - "20"
           - "22"
           - "24"
+        # The CVE-touched packages that ship a .tav.yml, split so each leg
+        # stays inside the job timeout.
+        tav:
+          - "instrumentation-mongodb instrumentation-mongoose instrumentation-redis instrumentation-ioredis"
+          - "instrumentation-aws-sdk instrumentation-hapi instrumentation-knex instrumentation-amqplib"
+          - "instrumentation-nestjs-core instrumentation-tedious instrumentation-mysql2 instrumentation-pg"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -128,45 +159,42 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm ci
         timeout-minutes: 10
-      - name: Download Build Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: compile-cache-${{ github.run_number }}
-          path: .nx
-      # Note: see comment in the compile job
-      - name: Set base and head commits
+      - name: Compile
+        run: npx nx run-many -t compile -p "$SEAL_PROJECTS"
+      - name: Start Test Services
         run: |
-          if [ "${{github.event_name}}" == "push" ]; then
-            echo "NX_BASE=origin/main~1" >> "$GITHUB_ENV"
-            echo "NX_HEAD=origin/main" >> "$GITHUB_ENV"
-          else
-            echo "NX_BASE=origin/main" >> "$GITHUB_ENV"
-            echo "NX_HEAD=HEAD" >> "$GITHUB_ENV"
-          fi
-      - name: Compile (Delta)
-        run: npm run compile:ci:affected
-      - name: Start Test Services (Delta)
-        run: npm run test-services:start:affected
-      - name: Test All Versions (Delta)
-        run: npm run test-all-versions:ci:affected
-      - name: Stop Test Services (Delta)
+          for i in 1 2 3; do
+            docker compose -f test/docker-compose.yaml up -d --wait $SEAL_SERVICES && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            docker compose -f test/docker-compose.yaml down
+            sleep 10
+          done
+      - name: Test All Versions
+        if: ${{ inputs.test-filter == '' }}
+        env:
+          SEAL_TAV: ${{ matrix.tav }}
+        run: npx cross-env NODE_OPTIONS='-r dotenv/config' DOTENV_CONFIG_PATH=./test/test-services.env sh -c 'echo $SEAL_TAV | tr " " "\n" | xargs -I {} -t npm run --if-present test-all-versions -w packages/{}'
+      - name: Stop Test Services
         if: always()
         run: npm run test-services:stop
-      - name: Upload Test Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: tests-coverage-cache-${{ github.run_number }}-${{ matrix.node }}
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 1
-          path: |
-            !node_modules
-            packages/*/.nyc_output/**
-            LICENSE
+      - name: Report skipped tests
+        if: always()
+        run: |
+          cat <<'SKIPS'
+          Pending (skipped) tests in these suites and why:
+          - instrumentation-ioredis "should create a child span for pubsub": upstream marks it it.skip (test/ioredis.test.ts).
+          - instrumentation-ioredis "should instrument connect with requireParentSpan equal false": upstream marks it it.skip (test/ioredis.test.ts).
+          - instrumentation-ioredis "should redact ACL SETUSER arguments in db.statement": this.skip() when the installed ioredis client has no acl() method (older ioredis versions under test-all-versions).
+          - instrumentation-aws-sdk "sqs receive context": upstream it.skip; span-context propagation to the SQS ReceiveMessage handler is broken with @aws-sdk/client-sqs >= 3.316.0 (open-telemetry/opentelemetry-js-contrib#1477).
+          - instrumentation-redis "redis v4-v5 cluster" (4 tests): skipped unless RUN_REDIS_CLUSTER_TESTS is set; they run against a live single-node cluster in the unit-test job and are skipped in test-all-versions, where upstream never runs them.
+          - instrumentation-redis "redis v4-v5 cluster mock" suite: skipped when the installed redis version does not export RedisClusterMultiCommand.
+          SKIPS
 
   coverage-report:
+    if: false
     needs: test-all-versions
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
