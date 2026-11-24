@@ -43,18 +43,6 @@ export const ATTR_DB_STATEMENT = 'db.statement' as const;
 export const ATTR_DB_SYSTEM = 'db.system' as const;
 
 /**
- * Deprecated, no replacement at this time.
- *
- * @example readonly_user
- * @example reporting_user
- *
- * @experimental This attribute is experimental and is subject to breaking changes in minor releases of `@opentelemetry/semantic-conventions`.
- *
- * @deprecated Removed, no replacement at this time.
- */
-export const ATTR_DB_USER = 'db.user' as const;
-
-/**
  * Deprecated, use `server.address` on client spans and `client.address` on server spans.
  *
  * @example example.com

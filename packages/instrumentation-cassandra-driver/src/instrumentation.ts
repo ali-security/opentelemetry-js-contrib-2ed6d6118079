@@ -26,7 +26,6 @@ import {
   ATTR_DB_NAME,
   ATTR_DB_STATEMENT,
   ATTR_DB_SYSTEM,
-  ATTR_DB_USER,
   ATTR_NET_PEER_NAME,
   ATTR_NET_PEER_PORT,
   DB_SYSTEM_NAME_VALUE_CASSANDRA,
@@ -347,13 +346,6 @@ export class CassandraDriverInstrumentation extends InstrumentationBase<Cassandr
       if (this._dbSemconvStability & SemconvStability.STABLE) {
         attributes[ATTR_DB_QUERY_TEXT] = statement;
       }
-    }
-
-    // db.user (deprecated, no stable replacement - only emit with OLD)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const user = (client as any).options?.credentials?.username;
-    if (user && this._dbSemconvStability & SemconvStability.OLD) {
-      attributes[ATTR_DB_USER] = user;
     }
 
     if (client.keyspace) {

@@ -31,7 +31,6 @@ import {
   DB_SYSTEM_VALUE_CASSANDRA,
   ATTR_DB_STATEMENT,
   ATTR_DB_SYSTEM,
-  ATTR_DB_USER,
   ATTR_NET_PEER_NAME,
   ATTR_NET_PEER_PORT,
   DB_SYSTEM_NAME_VALUE_CASSANDRA,
@@ -63,7 +62,6 @@ const cassandraContactPoint = process.env.CASSANDRA_HOST
 
 const DEFAULT_OLD_ATTRIBUTES = {
   [ATTR_DB_SYSTEM]: DB_SYSTEM_VALUE_CASSANDRA,
-  [ATTR_DB_USER]: 'cassandra',
 };
 
 const DEFAULT_STABLE_ATTRIBUTES = {
@@ -455,6 +453,8 @@ describe('CassandraDriverInstrumentation', () => {
         [],
         { code: SpanStatusCode.UNSET }
       );
+      // The connection username must never be recorded as `db.user`.
+      assert.strictEqual(spans[0].attributes['db.user'], undefined);
     });
 
     it('uses stable attributes when OTEL_SEMCONV_STABILITY_OPT_IN=http,database', async () => {
